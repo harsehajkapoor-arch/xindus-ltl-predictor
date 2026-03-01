@@ -358,33 +358,57 @@ def load_untitled_xlsx():
     rows = []
     for _, r in df.iterrows():
         try:
-            boxes,pallets=parse_pb(r['Number of pallets/Box'])
-            if boxes is None: continue
-            wt_kg=r['Weight (Kgs)']
-            if pd.isna(wt_kg): continue
-            tw=float(wt_kg)*KG_LBS
-            cost=parse_price(r['Achieved Price'])
-            if not cost or cost<=0: cost=parse_price(r['Estimated Price '])
-            if not cost or cost<=0: continue
-            tr=transit_days(r['Pickup Date'],r['Actual Delivery Date '])
-            if tr is None: continue
-            car=str(r['Carrier ']).strip()
-            if car in ('-','','nan'): car='Unknown'
-            mi=est_miles(r.get('Delivery adress',''))
-            tpb=tw/max(boxes,1)
-            bv=AW*AL*AH; tv=bv*boxes; bpp=max(1,(PAL_L*PAL_W)/max(AW*AL,1))
-            ph=max(6.0,min(round(tv/(pallets*PAL_L*PAL_W),1),80.0))
-            rows.append({
+            boxes, pallets = parse_pb(r['Number of pallets/Box'])
+            if boxes is None or pallets is None or boxes <= 0: continue
+
+            wt_kg = r['Weight (Kgs)']
+            if pd.isna(wt_kg) or float(wt_kg) <= 0: continue
+            tw = float(wt_kg) * KG_LBS
+
+            # Cost: must have a real positive value from either column
+            cost = parse_price(r['Achieved Price'])
+            if cost is None or cost <= 0:
+                cost = parse_price(r['Estimated Price '])
+            if cost is None or cost <= 0 or np.isnan(cost): continue
+
+            # Transit: must have valid pickup AND delivery dates
+            pickup   = r['Pickup Date']
+            delivery = r['Actual Delivery Date ']
+            if pd.isna(pickup) or pd.isna(delivery): continue
+            tr = transit_days(pickup, delivery)
+            if tr is None or tr < 0: continue
+
+            car = str(r['Carrier ']).strip()
+            if car in ('-', '', 'nan', 'NaN', 'None'): car = 'Unknown'
+
+            mi  = est_miles(r.get('Delivery adress', ''))
+            tpb = tw / max(boxes, 1)
+
+            bv  = AW * AL * AH
+            tv  = bv * boxes
+            bpp = max(1, (PAL_L * PAL_W) / max(AW * AL, 1))
+            ph  = max(6.0, min(round(tv / (pallets * PAL_L * PAL_W), 1), 80.0))
+
+            row_dict = {
                 'num_boxes':boxes,'w_avg_in':AW,'l_avg_in':AL,'h_avg_in':AH,'wt_avg_lbs':tpb,
                 'w_min_in':AW*0.9,'w_max_in':AW*1.1,'l_min_in':AL*0.9,'l_max_in':AL*1.1,
                 'h_min_in':AH*0.9,'h_max_in':AH*1.1,'wt_min_lbs':tpb*0.9,'wt_max_lbs':tpb*1.1,
                 'miles':mi,'box_vol_in3':bv,'total_vol_in3':tv,'total_weight_lbs':tw,
                 'boxes_per_layer':bpp,'vol_per_pallet_est':tv/max(pallets,1),
                 'wt_per_pallet_est':tw/max(pallets,1),'density_lbs_per_in3':tw/max(tv,1),
-                'total_pallets':pallets,'pallet_height_in':ph,'pallet_weight_lbs':tw/max(pallets,1),
-                'total_cost':cost,'carrier':car,'transit_days':tr,'_source':'untitled',
-            })
-        except: continue
+                'total_pallets':float(pallets),'pallet_height_in':float(ph),
+                'pallet_weight_lbs':float(tw/max(pallets,1)),
+                'total_cost':float(cost),'carrier':str(car),'transit_days':float(tr),
+                '_source':'untitled',
+            }
+            # Final NaN check on this row
+            if any(v is None or (isinstance(v, float) and np.isnan(v))
+                   for k, v in row_dict.items() if k != '_source'):
+                continue
+
+            rows.append(row_dict)
+        except:
+            continue
     return pd.DataFrame(rows)
 
 def feedback_to_features(fb_df):
@@ -437,13 +461,38 @@ def train_models():
     from sklearn.preprocessing import LabelEncoder
     from sklearn.impute import SimpleImputer
 
-    df  = load_all_training_data()
+    df_raw = load_all_training_data()
+
+    # ── Hard clean: drop any row where a target or feature is NaN/Inf ──
+    target_cols = ['total_pallets','pallet_height_in','pallet_weight_lbs',
+                   'total_cost','transit_days','carrier']
+    df = df_raw.copy()
+
+    # Convert numeric targets, coerce bad values to NaN
+    for col in ['total_pallets','pallet_height_in','pallet_weight_lbs',
+                'total_cost','transit_days']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Drop rows with NaN in any target
+    df = df.dropna(subset=target_cols)
+
+    # Drop rows with NaN/Inf in feature columns
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=FEATURE_COLS)
+
+    # Sanity: must have at least 10 rows
+    if len(df) < 10:
+        raise ValueError(f"Not enough clean training data (only {len(df)} rows after cleaning). Check your data files.")
+
+    # Fill carrier NaN with 'Unknown'
+    df['carrier'] = df['carrier'].fillna('Unknown').astype(str).str.strip()
+    df.loc[df['carrier'].isin(['', 'nan', 'NaN']), 'carrier'] = 'Unknown'
 
     imp = SimpleImputer(strategy='mean')
     X   = imp.fit_transform(df[FEATURE_COLS].values)
 
     le   = LabelEncoder()
-    y_c  = le.fit_transform(df['carrier'].astype(str).values)
+    y_c  = le.fit_transform(df['carrier'].values)
 
     def reg():
         return VotingRegressor([
@@ -460,19 +509,27 @@ def train_models():
                                            min_samples_leaf=1, random_state=42)),
         ], voting='soft')
 
-    m_pal = reg(); m_pal.fit(X, df['total_pallets'].values)
-    m_ph  = reg(); m_ph.fit(X,  df['pallet_height_in'].values)
-    m_pw  = reg(); m_pw.fit(X,  df['pallet_weight_lbs'].values)
-    m_co  = reg(); m_co.fit(X,  df['total_cost'].values)
-    m_tr  = reg(); m_tr.fit(X,  df['transit_days'].values)
+    # Train each model only on rows where that target is valid (extra safety)
+    def fit_reg(model, y_col):
+        mask = df[y_col].notna()
+        model.fit(X[mask], df.loc[mask, y_col].values)
+        return model
+
+    m_pal = fit_reg(reg(), 'total_pallets')
+    m_ph  = fit_reg(reg(), 'pallet_height_in')
+    m_pw  = fit_reg(reg(), 'pallet_weight_lbs')
+    m_co  = fit_reg(reg(), 'total_cost')
+    m_tr  = fit_reg(reg(), 'transit_days')
     m_car = clf(); m_car.fit(X, y_c)
+
+    n_feedback = int((df['_source'] == 'team_feedback').sum()) if '_source' in df.columns else 0
 
     return {
         'pallets':m_pal, 'pallet_height':m_ph, 'pallet_weight':m_pw,
         'cost':m_co, 'transit':m_tr, 'carrier':m_car,
         'label_encoder':le, 'imputer':imp,
         'n_records':len(df),
-        'n_feedback': len(df[df['_source']=='team_feedback']) if '_source' in df.columns else 0,
+        'n_feedback': n_feedback,
         'carriers': sorted(le.classes_.tolist()),
     }
 
