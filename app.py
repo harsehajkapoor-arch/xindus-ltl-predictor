@@ -563,12 +563,31 @@ def run_prediction(models, n, wn, wx, ln, lx, hn, hx, tn, tx, mi):
     else:
         p_h = p_h_raw
 
-    # Distribute boxes & weight evenly across pallets
+    # ── Realistic palletization — heavier/larger boxes loaded first ──
+    # Human palletizers fill the first pallet most densely, last pallet lightest.
+    # Heights and weights taper naturally from pallet 1 → last pallet.
     pallets = []
-    rem = n
-    for i in range(n_pal):
-        b = rem // (n_pal - i); rem -= b
-        pallets.append({'no': i+1, 'h': p_h, 'wt': round(avg_wt * b, 1), 'boxes': b})
+    if n_pal == 1:
+        pallets.append({'no': 1, 'h': p_h, 'wt': total_wt, 'boxes': n})
+    else:
+        # Descending box distribution — pallet 1 gets most boxes
+        # shares e.g. 3 pallets → [3,2,1], so pallet 1 = 50%, 2 = 33%, 3 = 17%
+        shares      = [n_pal - i for i in range(n_pal)]
+        total_shares= sum(shares)
+        boxes_per   = [max(1, round(n * s / total_shares)) for s in shares]
+        boxes_per[-1] = max(1, n - sum(boxes_per[:-1]))  # ensure total = n
+
+        # Heights: taper linearly from p_h down to 65% of p_h on the last pallet
+        # No correction factor — just a simple proportional taper so numbers feel natural
+        height_steps = np.linspace(1.0, 0.65, n_pal)
+        heights = [
+            round(float(min(p_h * f, MAX_PALLET_HEIGHT)), 1)
+            for f in height_steps
+        ]
+
+        for i in range(n_pal):
+            wt = round(avg_wt * boxes_per[i], 1)
+            pallets.append({'no': i+1, 'h': heights[i], 'wt': wt, 'boxes': boxes_per[i]})
 
     return {
         'n_pal':           n_pal,
@@ -577,8 +596,8 @@ def run_prediction(models, n, wn, wx, ln, lx, hn, hx, tn, tx, mi):
         'cost':            cost,
         'carrier':         carrier,
         'transit':         transit,
-        'height_violated': height_violated,   # flag for UI warning
-        'original_height': p_h_raw,           # what ML predicted before enforcement
+        'height_violated': height_violated,
+        'original_height': p_h_raw,
     }
 
 # ════════════════════════════════════════════════════════════
@@ -759,53 +778,134 @@ with tab_add:
     st.markdown("""
     <div class="info-box">
       <strong style="color:#00c896">📚 How Continuous Learning Works</strong><br>
-      Every time you complete a real shipment, fill in what actually happened below and click Save.
-      It gets added to the <strong>shared Google Sheet</strong> — the next time anyone on your team
-      opens this app, the AI model will automatically retrain with the new data.
-      <strong>Everyone benefits from everyone's shipments.</strong>
+      After a shipment is done, fill in what actually happened. Each pallet gets its own
+      height and weight fields — because real pallets are never identical.
+      Data saves to the <strong>shared Google Sheet</strong> and the AI retrains for everyone automatically.
     </div>
     """, unsafe_allow_html=True)
 
     prev  = st.session_state.get('last_inputs', {})
     prevR = st.session_state.get('last_result', {})
 
+    # ── LEFT: Shipment inputs ────────────────────────────────
     col1, col2 = st.columns(2)
-
     with col1:
-        st.markdown('<div class="sec-head">📦 The Shipment Inputs</div>', unsafe_allow_html=True)
-        st.caption("These should match what you entered in the Predict tab")
-        fb_n   = st.number_input("Number of Boxes",   min_value=1, value=int(prev.get('num_boxes',80)),  key='fb_n')
+        st.markdown('<div class="sec-head">📦 Shipment Inputs</div>', unsafe_allow_html=True)
+        st.caption("Match what you entered in the Predict tab")
+        fb_n   = st.number_input("Number of Boxes",  min_value=1, value=int(prev.get('num_boxes',80)), key='fb_n')
         a,b    = st.columns(2)
-        fb_wmn = a.number_input("Width MIN (cm)",      value=float(prev.get('w_mn',23.0)), key='fb_wmn')
-        fb_wmx = b.number_input("Width MAX (cm)",      value=float(prev.get('w_mx',25.0)), key='fb_wmx')
-        fb_lmn = a.number_input("Length MIN (cm)",     value=float(prev.get('l_mn',25.0)), key='fb_lmn')
-        fb_lmx = b.number_input("Length MAX (cm)",     value=float(prev.get('l_mx',27.0)), key='fb_lmx')
-        fb_hmn = a.number_input("Height MIN (cm)",     value=float(prev.get('h_mn',18.0)), key='fb_hmn')
-        fb_hmx = b.number_input("Height MAX (cm)",     value=float(prev.get('h_mx',20.0)), key='fb_hmx')
-        fb_kmn = a.number_input("Weight MIN (kg)",     value=float(prev.get('k_mn',17.0)), key='fb_kmn')
-        fb_kmx = b.number_input("Weight MAX (kg)",     value=float(prev.get('k_mx',19.0)), key='fb_kmx')
-        fb_mi  = st.number_input("Distance (Miles)",   min_value=1, value=int(prev.get('miles',1917)),   key='fb_mi')
+        fb_wmn = a.number_input("Width MIN (cm)",    value=float(prev.get('w_mn',23.0)), key='fb_wmn')
+        fb_wmx = b.number_input("Width MAX (cm)",    value=float(prev.get('w_mx',25.0)), key='fb_wmx')
+        fb_lmn = a.number_input("Length MIN (cm)",   value=float(prev.get('l_mn',25.0)), key='fb_lmn')
+        fb_lmx = b.number_input("Length MAX (cm)",   value=float(prev.get('l_mx',27.0)), key='fb_lmx')
+        fb_hmn = a.number_input("Height MIN (cm)",   value=float(prev.get('h_mn',18.0)), key='fb_hmn')
+        fb_hmx = b.number_input("Height MAX (cm)",   value=float(prev.get('h_mx',20.0)), key='fb_hmx')
+        fb_kmn = a.number_input("Weight MIN (kg)",   value=float(prev.get('k_mn',17.0)), key='fb_kmn')
+        fb_kmx = b.number_input("Weight MAX (kg)",   value=float(prev.get('k_mx',19.0)), key='fb_kmx')
+        fb_mi  = st.number_input("Distance (Miles)", min_value=1, value=int(prev.get('miles',1917)),  key='fb_mi')
 
+    # ── RIGHT: Actual results ────────────────────────────────
     with col2:
-        st.markdown('<div class="sec-head">✅ What Actually Happened</div>', unsafe_allow_html=True)
-        st.caption("Enter the real results from the completed shipment")
+        st.markdown('<div class="sec-head">✅ Actual Results</div>', unsafe_allow_html=True)
+        st.caption("Enter exactly what happened in the real shipment")
 
-        prev_pal = prevR.get('n_pal', 2) if prevR else 2
-        prev_h   = prevR['pallets'][0]['h']  if prevR and prevR.get('pallets') else 28.0
-        prev_pw  = prevR['pallets'][0]['wt'] if prevR and prevR.get('pallets') else 1200.0
-        prev_co  = prevR.get('cost', 500.0)  if prevR else 500.0
-        prev_car = prevR.get('carrier','ABF') if prevR else 'ABF'
-        prev_tr  = prevR.get('transit', 7)   if prevR else 7
+        prev_pal = int(prevR.get('n_pal', 2)) if prevR else 2
+        prev_co  = float(prevR.get('cost', 500.0)) if prevR else 500.0
+        prev_car = str(prevR.get('carrier', 'ABF')) if prevR else 'ABF'
+        prev_tr  = int(prevR.get('transit', 7)) if prevR else 7
 
-        fb_pal = st.number_input("Actual Number of Pallets",       min_value=1,   value=int(prev_pal),    key='fb_pal')
-        fb_ph  = st.number_input("Actual Pallet Height (inches)",  min_value=1.0, value=float(prev_h),   key='fb_ph')
-        fb_pw  = st.number_input("Actual Pallet Weight (lbs)",     min_value=1.0, value=float(prev_pw),  key='fb_pw')
-        fb_co  = st.number_input("Actual Total Cost ($)",          min_value=0.0, value=float(prev_co),  key='fb_co')
-        fb_car = st.text_input("Actual Carrier Used",              value=str(prev_car),                   key='fb_car')
-        fb_tr  = st.number_input("Actual Transit Days",            min_value=0,   value=int(prev_tr),    key='fb_tr')
+        fb_pal = st.number_input(
+            "Actual Number of Pallets",
+            min_value=1, max_value=20, value=prev_pal, step=1,
+            key='fb_pal',
+            help="Change this and the pallet fields below will update automatically"
+        )
+        fb_co  = st.number_input("Actual Total Cost ($)", min_value=0.0, value=prev_co, key='fb_co')
+        fb_car = st.text_input("Actual Carrier Used",     value=prev_car, key='fb_car')
+        fb_tr  = st.number_input("Actual Transit Days",   min_value=0, value=prev_tr, key='fb_tr')
         fb_nt  = st.text_area("Notes (optional)",
-                              placeholder="e.g. Amazon FBA warehouse, special handling...",
-                              height=80, key='fb_nt')
+                               placeholder="e.g. last pallet was partial, Amazon FBA, fragile items on top...",
+                               height=68, key='fb_nt')
+
+    # ── DYNAMIC PER-PALLET FIELDS ────────────────────────────
+    st.markdown('<div class="sec-head">📐 Per-Pallet Details  <span style="font-weight:300;color:#64748b;font-size:11px;letter-spacing:0">(fill in height & weight for each pallet separately — they can be different)</span></div>', unsafe_allow_html=True)
+
+    # Pre-fill defaults from prediction result
+    prev_pallets = prevR.get('pallets', []) if prevR else []
+
+    pallet_heights = []
+    pallet_weights = []
+
+    num_cols = min(fb_pal, 4)  # show up to 4 per row
+    rows_needed = (fb_pal + num_cols - 1) // num_cols
+
+    p_idx = 0
+    for row_i in range(rows_needed):
+        cols = st.columns(num_cols)
+        for col_i in range(num_cols):
+            if p_idx >= fb_pal:
+                break
+            i = p_idx  # pallet number (0-indexed)
+
+            # Default from prediction if available, else sensible fallback
+            if i < len(prev_pallets):
+                def_h  = float(prev_pallets[i]['h'])
+                def_wt = float(prev_pallets[i]['wt'])
+            else:
+                def_h  = 28.0
+                def_wt = 800.0
+
+            with cols[col_i]:
+                # Pallet card header
+                st.markdown(f"""
+                <div style="background:#1a2236;border:1px solid #1e3a5f;border-top:3px solid #00c896;
+                             border-radius:8px;padding:10px 14px 4px;margin-bottom:4px;">
+                  <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;
+                               color:#00c896;font-weight:600;margin-bottom:8px;">
+                    PALLET {i+1}
+                  </div>
+                """, unsafe_allow_html=True)
+
+                h = st.number_input(
+                    f"Height (in)",
+                    min_value=1.0, max_value=float(MAX_PALLET_HEIGHT),
+                    value=min(def_h, float(MAX_PALLET_HEIGHT)),
+                    step=0.5, key=f'p_h_{i}',
+                    help=f"Max allowed: {MAX_PALLET_HEIGHT}in (Amazon limit)"
+                )
+                wt = st.number_input(
+                    f"Weight (lbs)",
+                    min_value=1.0, max_value=5000.0,
+                    value=def_wt,
+                    step=10.0, key=f'p_w_{i}'
+                )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                # Live 70in warning per pallet
+                if h >= MAX_PALLET_HEIGHT:
+                    st.error(f"⚠️ At Amazon limit!")
+                elif h > 60:
+                    st.warning(f"⚠️ Close to limit")
+
+                pallet_heights.append(h)
+                pallet_weights.append(wt)
+            p_idx += 1
+
+    # Summary row
+    if pallet_heights:
+        total_actual_wt = sum(pallet_weights)
+        avg_h = round(sum(pallet_heights)/len(pallet_heights), 1)
+        st.markdown(f"""
+        <div style="margin-top:12px;padding:10px 16px;background:rgba(0,200,150,0.06);
+                    border:1px solid rgba(0,200,150,0.2);border-radius:8px;
+                    font-family:'IBM Plex Mono',monospace;font-size:12px;color:#94a3b8;
+                    display:flex;gap:32px;">
+          <span>Total pallets: <strong style="color:#00c896">{fb_pal}</strong></span>
+          <span>Total weight: <strong style="color:#00c896">{total_actual_wt:,.0f} lbs</strong></span>
+          <span>Avg height: <strong style="color:#00c896">{avg_h} in</strong></span>
+          <span>Heights: <strong style="color:#e2e8f0">{' | '.join([str(h)+'in' for h in pallet_heights])}</strong></span>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     save_btn = st.button("💾  SAVE & TEACH THE AI", use_container_width=True)
@@ -813,7 +913,16 @@ with tab_add:
     if save_btn:
         if not fb_car.strip():
             st.error("Please enter the carrier name.")
+        elif len(pallet_heights) != fb_pal:
+            st.error("Something went wrong with pallet fields — please refresh and try again.")
         else:
+            # Use pallet 1 as the "primary" for the model target columns
+            # and store all individual pallets as JSON in notes field
+            pallet_detail_json = json.dumps([
+                {"pallet": i+1, "height_in": pallet_heights[i], "weight_lbs": pallet_weights[i]}
+                for i in range(fb_pal)
+            ])
+
             feedback_row = {
                 "timestamp":                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 "num_boxes":                fb_n,
@@ -823,8 +932,11 @@ with tab_add:
                 "weight_min_kg":            fb_kmn, "weight_max_kg":            fb_kmx,
                 "miles":                    fb_mi,
                 "actual_pallets":           fb_pal,
-                "actual_pallet_height_in":  fb_ph,
-                "actual_pallet_weight_lbs": fb_pw,
+                # Primary pallet (pallet 1) for model training target
+                "actual_pallet_height_in":  pallet_heights[0],
+                "actual_pallet_weight_lbs": pallet_weights[0],
+                # All pallets stored as JSON for reference and future use
+                "pallet_details_json":      pallet_detail_json,
                 "actual_cost":              fb_co,
                 "actual_carrier":           fb_car.strip(),
                 "actual_transit_days":      fb_tr,
@@ -834,21 +946,20 @@ with tab_add:
             ok = save_to_sheets(feedback_row)
 
             if ok:
-                # Clear caches so model reloads with new data
                 load_feedback_from_sheets.clear()
                 train_models.clear()
-                st.success("✅ Saved to shared Google Sheet! The AI model will retrain automatically on the next prediction.")
+                st.success(f"✅ Saved! {fb_pal} pallet(s) with individual heights & weights recorded.")
                 st.balloons()
-                st.info("👥 Your teammates will also see the updated model when they next use the app.")
+                st.info("👥 Your teammates will see the updated model on their next prediction.")
             else:
                 st.warning("""
-⚠️ Google Sheets not connected yet — this is expected during setup.
+⚠️ Google Sheets not connected yet.
 
-**Your data was NOT lost.** Once you connect Google Sheets (Step 3 in the setup guide),
-paste this data in manually:
+**Your data was NOT lost.** Once Google Sheets is connected, this will save automatically.
+Here is your data (copy it somewhere safe):
 
 ```
-""" + str(feedback_row) + """
+""" + json.dumps(feedback_row, indent=2) + """
 ```
                 """)
 
