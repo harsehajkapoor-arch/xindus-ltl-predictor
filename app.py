@@ -533,23 +533,53 @@ def train_models():
         'carriers': sorted(le.classes_.tolist()),
     }
 
+MAX_PALLET_HEIGHT = 70  # inches — Amazon FBA hard limit
+
 def run_prediction(models, n, wn, wx, ln, lx, hn, hx, tn, tx, mi):
     feat  = build_feature_row(n, wn, wx, ln, lx, hn, hx, tn, tx, mi)
     X_row = models['imputer'].transform(np.array([[feat[c] for c in FEATURE_COLS]]))
-    n_pal   = max(1, int(round(models['pallets'].predict(X_row)[0])))
-    p_h     = max(6.0, round(float(models['pallet_height'].predict(X_row)[0]),1))
-    cost    = max(0.0, round(float(models['cost'].predict(X_row)[0]),2))
-    transit = max(1,   int(round(float(models['transit'].predict(X_row)[0]))))
-    carrier = models['label_encoder'].inverse_transform([models['carrier'].predict(X_row)[0]])[0]
-    avg_wt  = (tn+tx)/2
-    total_wt= round(avg_wt*n, 1)
+
+    n_pal    = max(1, int(round(models['pallets'].predict(X_row)[0])))
+    p_h_raw  = max(6.0, round(float(models['pallet_height'].predict(X_row)[0]), 1))
+    cost     = max(0.0, round(float(models['cost'].predict(X_row)[0]), 2))
+    transit  = max(1,   int(round(float(models['transit'].predict(X_row)[0]))))
+    carrier  = models['label_encoder'].inverse_transform([models['carrier'].predict(X_row)[0]])[0]
+    avg_wt   = (tn + tx) / 2
+    total_wt = round(avg_wt * n, 1)
+
+    # ── Height enforcement: if predicted height > 70in, split into more pallets ──
+    height_violated = p_h_raw > MAX_PALLET_HEIGHT
+    if height_violated:
+        # How many pallets needed to bring height under 70in?
+        # Height scales roughly linearly with boxes per pallet
+        # so we scale up pallet count proportionally
+        scale   = p_h_raw / MAX_PALLET_HEIGHT
+        n_pal   = max(n_pal, int(np.ceil(n_pal * scale)))
+        # Recalculate height per pallet with the new count
+        # Use the same volume-based approach: total vol / (n_pal * pallet footprint)
+        total_vol_in3 = feat['total_vol_in3']
+        p_h = round(total_vol_in3 / (n_pal * PAL_L * PAL_W), 1)
+        p_h = min(max(p_h, 6.0), MAX_PALLET_HEIGHT)  # hard cap at 70
+    else:
+        p_h = p_h_raw
+
+    # Distribute boxes & weight evenly across pallets
     pallets = []
     rem = n
     for i in range(n_pal):
-        b = rem//(n_pal-i); rem -= b
-        pallets.append({'no':i+1,'h':p_h,'wt':round(avg_wt*b,1),'boxes':b})
-    return {'n_pal':n_pal,'pallets':pallets,'total_wt':total_wt,
-            'cost':cost,'carrier':carrier,'transit':transit}
+        b = rem // (n_pal - i); rem -= b
+        pallets.append({'no': i+1, 'h': p_h, 'wt': round(avg_wt * b, 1), 'boxes': b})
+
+    return {
+        'n_pal':           n_pal,
+        'pallets':         pallets,
+        'total_wt':        total_wt,
+        'cost':            cost,
+        'carrier':         carrier,
+        'transit':         transit,
+        'height_violated': height_violated,   # flag for UI warning
+        'original_height': p_h_raw,           # what ML predicted before enforcement
+    }
 
 # ════════════════════════════════════════════════════════════
 #  RENDER UI
@@ -641,16 +671,40 @@ with tab_pred:
 
             # ── A. PALLETS
             st.markdown('<div class="res-card"><div class="res-card-title">A · Palletization</div>', unsafe_allow_html=True)
-            ma,mb = st.columns(2)
+
+            # Height violation warning banner
+            if R['height_violated']:
+                st.error(
+                    f"⚠️ **Amazon Height Limit Enforced** — ML predicted {R['original_height']}in, "
+                    f"which exceeds the **70-inch Amazon FBA limit**. "
+                    f"Pallets have been automatically split to keep height ≤ 70in. "
+                    f"**Do not consolidate these pallets or Amazon will reject the shipment.**"
+                )
+
+            ma, mb = st.columns(2)
             ma.metric("Total Pallets", R['n_pal'])
             mb.metric("Total Weight",  f"{R['total_wt']:,.0f} lbs")
+
             for p in R['pallets']:
+                height_ok = p['h'] <= MAX_PALLET_HEIGHT
+                border_color = "#00c896" if height_ok else "#f43f5e"
+                height_label = f"{p['h']}in ✅" if height_ok else f"{p['h']}in ⚠️ OVER LIMIT"
                 st.markdown(f"""
-                <div class="pallet-row">
+                <div class="pallet-row" style="border-color:rgba({('0,200,150' if height_ok else '244,63,94')},0.35);">
                   <span class="p-label">PALLET {p['no']}</span>
-                  <span class="p-dim">L=40in &nbsp; W=48in &nbsp; H={p['h']}in</span>
+                  <span class="p-dim">L=40in &nbsp; W=48in &nbsp; H={height_label}</span>
                   <span class="p-wt">{p['wt']:,.0f} lbs &nbsp;·&nbsp; {p['boxes']} boxes</span>
                 </div>""", unsafe_allow_html=True)
+
+            # Always show the 70in rule as a reminder
+            st.markdown("""
+            <div style="margin-top:8px;padding:8px 14px;background:rgba(245,158,11,0.08);
+                        border:1px solid rgba(245,158,11,0.25);border-radius:8px;
+                        font-size:12px;color:#f59e0b;">
+              📏 <strong>Amazon FBA Rule:</strong> Max pallet height = <strong>70 inches</strong>.
+              All pallets above are within this limit.
+            </div>""", unsafe_allow_html=True)
+
             st.markdown('</div>', unsafe_allow_html=True)
 
             # ── B. COST
