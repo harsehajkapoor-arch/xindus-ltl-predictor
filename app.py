@@ -412,32 +412,79 @@ def load_untitled_xlsx():
     return pd.DataFrame(rows)
 
 def feedback_to_features(fb_df):
-    """Convert Google Sheets feedback rows into training feature rows."""
-    if fb_df.empty: return pd.DataFrame()
-    rows=[]
+    """
+    Convert Google Sheets feedback rows into ML training feature rows.
+
+    Each feedback row generates one training row per pallet (using pallet_details_json),
+    so the model learns from EVERY pallet's real height & weight — not just pallet 1.
+    This is the key to the model truly learning from team feedback.
+    """
+    if fb_df.empty:
+        return pd.DataFrame()
+
+    rows = []
     for _, r in fb_df.iterrows():
         try:
             n   = int(r['num_boxes'])
-            wn  = float(r['width_min_cm'])*CM_IN;  wx=float(r['width_max_cm'])*CM_IN
-            ln  = float(r['length_min_cm'])*CM_IN; lx=float(r['length_max_cm'])*CM_IN
-            hn  = float(r['height_min_cm'])*CM_IN; hx=float(r['height_max_cm'])*CM_IN
-            tn  = float(r['weight_min_kg'])*KG_LBS;tx=float(r['weight_max_kg'])*KG_LBS
+            wn  = float(r['width_min_cm'])  * CM_IN;  wx = float(r['width_max_cm'])  * CM_IN
+            ln  = float(r['length_min_cm']) * CM_IN;  lx = float(r['length_max_cm']) * CM_IN
+            hn  = float(r['height_min_cm']) * CM_IN;  hx = float(r['height_max_cm']) * CM_IN
+            tn  = float(r['weight_min_kg']) * KG_LBS; tx = float(r['weight_max_kg']) * KG_LBS
             mi  = float(r['miles'])
             np_ = int(r['actual_pallets'])
-            feat= build_feature_row(n,wn,wx,ln,lx,hn,hx,tn,tx,mi)
-            feat.update({
-                'vol_per_pallet_est':feat['total_vol_in3']/max(np_,1),
-                'wt_per_pallet_est': feat['total_weight_lbs']/max(np_,1),
-                'total_pallets':np_,
-                'pallet_height_in':  float(r['actual_pallet_height_in']),
-                'pallet_weight_lbs': float(r['actual_pallet_weight_lbs']),
-                'total_cost':        float(r['actual_cost']),
-                'carrier':           str(r['actual_carrier']).strip(),
-                'transit_days':      int(r['actual_transit_days']),
-                '_source':           'team_feedback',
+            cost    = float(r['actual_cost'])
+            carrier = str(r['actual_carrier']).strip()
+            transit = int(r['actual_transit_days'])
+
+            if any(isinstance(v, float) and np.isnan(v) for v in [mi, cost, float(transit)]):
+                continue
+            if not carrier or carrier in ('nan', 'None', ''):
+                carrier = 'Unknown'
+
+            feat_base = build_feature_row(n, wn, wx, ln, lx, hn, hx, tn, tx, mi)
+            feat_base.update({
+                'vol_per_pallet_est': feat_base['total_vol_in3']    / max(np_, 1),
+                'wt_per_pallet_est':  feat_base['total_weight_lbs'] / max(np_, 1),
+                'total_pallets':      float(np_),
+                'total_cost':         cost,
+                'carrier':            carrier,
+                'transit_days':       float(transit),
+                '_source':            'team_feedback',
             })
-            rows.append(feat)
-        except: continue
+
+            # Try to get per-pallet details from pallet_details_json
+            pallet_details = []
+            json_col = r.get('pallet_details_json', None)
+            if json_col and str(json_col) not in ('', 'nan', 'None'):
+                try:
+                    pallet_details = json.loads(str(json_col))
+                except Exception:
+                    pallet_details = []
+
+            if pallet_details:
+                # One training row per pallet — model learns full height/weight distribution
+                for p in pallet_details:
+                    p_h  = float(p.get('height_in',  r.get('actual_pallet_height_in', 28)))
+                    p_wt = float(p.get('weight_lbs', r.get('actual_pallet_weight_lbs', 800)))
+                    if np.isnan(p_h) or np.isnan(p_wt):
+                        continue
+                    row_feat = dict(feat_base)
+                    row_feat['pallet_height_in']  = min(p_h, MAX_PALLET_HEIGHT)
+                    row_feat['pallet_weight_lbs'] = p_wt
+                    rows.append(row_feat)
+            else:
+                # Fallback: older feedback format — only pallet 1 stored
+                p_h  = float(r.get('actual_pallet_height_in',  28))
+                p_wt = float(r.get('actual_pallet_weight_lbs', 800))
+                if not (np.isnan(p_h) or np.isnan(p_wt)):
+                    row_feat = dict(feat_base)
+                    row_feat['pallet_height_in']  = min(p_h, MAX_PALLET_HEIGHT)
+                    row_feat['pallet_weight_lbs'] = p_wt
+                    rows.append(row_feat)
+
+        except Exception:
+            continue
+
     return pd.DataFrame(rows)
 
 def load_all_training_data():
