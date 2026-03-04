@@ -580,7 +580,8 @@ def train_models():
         'carriers': sorted(le.classes_.tolist()),
     }
 
-MAX_PALLET_HEIGHT = 70  # inches — Amazon FBA hard limit
+MAX_PALLET_HEIGHT = 70    # inches — Amazon FBA hard limit
+MAX_PALLET_WEIGHT = 1400  # lbs   — per pallet weight limit
 
 def run_prediction(models, n, wn, wx, ln, lx, hn, hx, tn, tx, mi):
     feat  = build_feature_row(n, wn, wx, ln, lx, hn, hx, tn, tx, mi)
@@ -594,57 +595,57 @@ def run_prediction(models, n, wn, wx, ln, lx, hn, hx, tn, tx, mi):
     avg_wt   = (tn + tx) / 2
     total_wt = round(avg_wt * n, 1)
 
-    # ── Height enforcement: if predicted height > 70in, split into more pallets ──
+    # ── CONSTRAINT 1: Height ≤ 70in per pallet ──────────────────────
     height_violated = p_h_raw > MAX_PALLET_HEIGHT
     if height_violated:
-        # How many pallets needed to bring height under 70in?
-        # Height scales roughly linearly with boxes per pallet
-        # so we scale up pallet count proportionally
-        scale   = p_h_raw / MAX_PALLET_HEIGHT
-        n_pal   = max(n_pal, int(np.ceil(n_pal * scale)))
-        # Recalculate height per pallet with the new count
-        # Use the same volume-based approach: total vol / (n_pal * pallet footprint)
-        total_vol_in3 = feat['total_vol_in3']
-        p_h = round(total_vol_in3 / (n_pal * PAL_L * PAL_W), 1)
-        p_h = min(max(p_h, 6.0), MAX_PALLET_HEIGHT)  # hard cap at 70
+        scale  = p_h_raw / MAX_PALLET_HEIGHT
+        n_pal  = max(n_pal, int(np.ceil(n_pal * scale)))
+        p_h    = round(feat['total_vol_in3'] / (n_pal * PAL_L * PAL_W), 1)
+        p_h    = min(max(p_h, 6.0), MAX_PALLET_HEIGHT)
     else:
         p_h = p_h_raw
 
-    # ── Realistic palletization — heavier/larger boxes loaded first ──
-    # Human palletizers fill the first pallet most densely, last pallet lightest.
-    # Heights and weights taper naturally from pallet 1 → last pallet.
+    # ── CONSTRAINT 2: Weight ≤ 1400 lbs per pallet ──────────────────
+    # If total weight / current pallet count exceeds limit, add more pallets
+    weight_violated = False
+    if n_pal > 0 and (total_wt / n_pal) > MAX_PALLET_WEIGHT:
+        weight_violated = True
+        n_pal_for_weight = int(np.ceil(total_wt / MAX_PALLET_WEIGHT))
+        n_pal = max(n_pal, n_pal_for_weight)
+        # Recalculate height now that we have more pallets
+        p_h = round(feat['total_vol_in3'] / (n_pal * PAL_L * PAL_W), 1)
+        p_h = min(max(p_h, 6.0), MAX_PALLET_HEIGHT)
+
+    # ── Realistic palletization: heavier boxes go on first pallets ──
     pallets = []
     if n_pal == 1:
         pallets.append({'no': 1, 'h': p_h, 'wt': total_wt, 'boxes': n})
     else:
-        # Descending box distribution — pallet 1 gets most boxes
-        # shares e.g. 3 pallets → [3,2,1], so pallet 1 = 50%, 2 = 33%, 3 = 17%
-        shares      = [n_pal - i for i in range(n_pal)]
-        total_shares= sum(shares)
-        boxes_per   = [max(1, round(n * s / total_shares)) for s in shares]
-        boxes_per[-1] = max(1, n - sum(boxes_per[:-1]))  # ensure total = n
+        shares       = [n_pal - i for i in range(n_pal)]
+        total_shares = sum(shares)
+        boxes_per    = [max(1, round(n * s / total_shares)) for s in shares]
+        boxes_per[-1] = max(1, n - sum(boxes_per[:-1]))
 
-        # Heights: taper linearly from p_h down to 65% of p_h on the last pallet
-        # No correction factor — just a simple proportional taper so numbers feel natural
         height_steps = np.linspace(1.0, 0.65, n_pal)
-        heights = [
-            round(float(min(p_h * f, MAX_PALLET_HEIGHT)), 1)
-            for f in height_steps
-        ]
+        heights = [round(float(min(p_h * f, MAX_PALLET_HEIGHT)), 1) for f in height_steps]
 
         for i in range(n_pal):
             wt = round(avg_wt * boxes_per[i], 1)
+            # Hard cap each pallet weight at MAX_PALLET_WEIGHT
+            wt = min(wt, MAX_PALLET_WEIGHT)
             pallets.append({'no': i+1, 'h': heights[i], 'wt': wt, 'boxes': boxes_per[i]})
 
     return {
-        'n_pal':           n_pal,
-        'pallets':         pallets,
-        'total_wt':        total_wt,
-        'cost':            cost,
-        'carrier':         carrier,
-        'transit':         transit,
-        'height_violated': height_violated,
-        'original_height': p_h_raw,
+        'n_pal':            n_pal,
+        'pallets':          pallets,
+        'total_wt':         total_wt,
+        'cost':             cost,
+        'carrier':          carrier,
+        'transit':          transit,
+        'height_violated':  height_violated,
+        'weight_violated':  weight_violated,
+        'original_height':  p_h_raw,
+        'original_avg_wt':  round(total_wt / max(n_pal, 1), 1),
     }
 
 # ════════════════════════════════════════════════════════════
@@ -811,23 +812,24 @@ with tab_pred:
         with col_miles_b:
             miles_b = st.number_input("Distance (Miles)", min_value=1, max_value=5000, value=1917, step=10, key="miles_b")
 
-        parse_btn = st.button("🔍  EXTRACT BOXES & PREDICT", key="pred_paste")
+        extract_btn = st.button("🔍  EXTRACT BOX DATA", key="pred_paste")
 
-        if erp_text and parse_btn:
+        if erp_text and extract_btn:
             erp_boxes = parse_erp_text(erp_text)
             if erp_boxes:
-                parsed_inputs = boxes_to_inputs(erp_boxes)
-                st.session_state['pred_miles']  = miles_b
-                st.session_state['pred_inputs'] = parsed_inputs
-                st.session_state['erp_boxes']   = erp_boxes
+                st.session_state['pred_miles']    = miles_b
+                st.session_state['pred_inputs']   = boxes_to_inputs(erp_boxes)
+                st.session_state['erp_boxes']     = erp_boxes
+                st.session_state['erp_extracted'] = True
             else:
-                st.error("❌ Could not find any box data in the pasted text. Make sure you copied the full ERP page.")
+                st.error("❌ Could not find box data. Make sure you copied the full ERP page.")
+                st.session_state['erp_extracted'] = False
 
-        # Show parsed box table if available
-        if erp_text and not parse_btn:
+        # Live preview while typing (before extract is clicked)
+        if erp_text and not st.session_state.get('erp_extracted'):
             preview = parse_erp_text(erp_text)
             if preview:
-                st.success(f"✅ Found **{len(preview)} boxes** — click EXTRACT & PREDICT to run the model")
+                st.success(f"✅ Found **{len(preview)} boxes** — click EXTRACT BOX DATA to continue")
 
     # ════════════════════════════════════
     #  MODE C — UPLOAD PDF
@@ -860,6 +862,11 @@ with tab_pred:
     # ════════════════════════════════════
     #  SHARED: Show parsed box summary + predict
     # ════════════════════════════════════
+    # For paste/PDF modes: read inputs from session_state (survives reruns)
+    if input_mode != "✏️  Enter Manually":
+        parsed_inputs = st.session_state.get('pred_inputs', None)
+        erp_boxes     = st.session_state.get('erp_boxes', [])
+
     if parsed_inputs and input_mode != "✏️  Enter Manually":
         erp_boxes = st.session_state.get('erp_boxes', [])
         miles     = st.session_state.get('pred_miles', 1917)
@@ -893,21 +900,24 @@ with tab_pred:
     # ════════════════════════════════════
     #  RESULTS (shared for all modes)
     # ════════════════════════════════════
-    do_predict = st.session_state.get('do_predict', False) if input_mode != "✏️  Enter Manually" else ('pred_manual' in st.session_state and st.session_state.get('pred_inputs'))
+    final_miles = st.session_state.get('pred_miles', 1917)
 
-    # Resolve final inputs & miles
-    final_inputs = st.session_state.get('pred_inputs') if input_mode != "✏️  Enter Manually" else (parsed_inputs if 'predict_btn' in dir() and predict_btn else None)
-    final_miles  = st.session_state.get('pred_miles', 1917)
-
-    # Run prediction when triggered
     run_now = False
-    if input_mode == "✏️  Enter Manually" and 'predict_btn' in dir() and predict_btn and parsed_inputs:
-        run_now = True
-        final_inputs = parsed_inputs
-        final_miles  = miles
-    elif input_mode != "✏️  Enter Manually" and st.session_state.get('do_predict'):
-        run_now = True
-        st.session_state['do_predict'] = False
+    final_inputs = None
+
+    if input_mode == "✏️  Enter Manually":
+        # Manual mode: predict_btn is defined above and parsed_inputs is set
+        if 'predict_btn' in dir() and predict_btn and parsed_inputs:
+            run_now = True
+            final_inputs = parsed_inputs
+            final_miles  = miles
+    else:
+        # Paste/PDF mode: driven entirely by session_state
+        if st.session_state.get('do_predict') and st.session_state.get('pred_inputs'):
+            run_now = True
+            final_inputs = st.session_state['pred_inputs']
+            final_miles  = st.session_state.get('pred_miles', 1917)
+            st.session_state['do_predict'] = False
 
     if run_now and final_inputs:
         inp = final_inputs
@@ -934,10 +944,15 @@ with tab_pred:
 
         if R['height_violated']:
             st.error(
-                f"⚠️ **Amazon Height Limit Enforced** — ML predicted {R['original_height']}in, "
-                f"which exceeds the **70-inch Amazon FBA limit**. "
-                f"Pallets have been automatically split to keep height ≤ 70in. "
-                f"**Do not consolidate these pallets or Amazon will reject the shipment.**"
+                f"⚠️ **Amazon Height Limit Enforced** — ML predicted {R['original_height']}in "
+                f"which exceeds the **70-inch limit**. "
+                f"Pallets split automatically to keep height ≤ 70in."
+            )
+        if R['weight_violated']:
+            st.warning(
+                f"⚠️ **Weight Limit Enforced** — average pallet weight exceeded **1,400 lbs**. "
+                f"Pallets have been split to keep each pallet ≤ 1,400 lbs. "
+                f"**Do not overload pallets or carrier will reject the shipment.**"
             )
 
         ma, mb = st.columns(2)
@@ -945,20 +960,26 @@ with tab_pred:
         mb.metric("Total Weight",  f"{R['total_wt']:,.0f} lbs")
 
         for p in R['pallets']:
-            height_ok    = p['h'] <= MAX_PALLET_HEIGHT
-            height_label = f"{p['h']}in ✅" if height_ok else f"{p['h']}in ⚠️ OVER LIMIT"
+            height_ok  = p['h'] <= MAX_PALLET_HEIGHT
+            weight_ok  = p['wt'] <= MAX_PALLET_WEIGHT
+            both_ok    = height_ok and weight_ok
+            row_color  = '0,200,150' if both_ok else '244,63,94'
+            h_label    = f"{p['h']}in ✅" if height_ok else f"{p['h']}in ⚠️"
+            w_label    = f"{p['wt']:,.0f} lbs ✅" if weight_ok else f"{p['wt']:,.0f} lbs ⚠️ OVER 1400"
             st.markdown(f"""
-            <div class="pallet-row" style="border-color:rgba({('0,200,150' if height_ok else '244,63,94')},0.35);">
+            <div class="pallet-row" style="border-color:rgba({row_color},0.35);">
               <span class="p-label">PALLET {p['no']}</span>
-              <span class="p-dim">L=40in &nbsp; W=48in &nbsp; H={height_label}</span>
-              <span class="p-wt">{p['wt']:,.0f} lbs &nbsp;·&nbsp; {p['boxes']} boxes</span>
+              <span class="p-dim">L=40in &nbsp; W=48in &nbsp; H={h_label}</span>
+              <span class="p-wt">{w_label} &nbsp;·&nbsp; {p['boxes']} boxes</span>
             </div>""", unsafe_allow_html=True)
 
         st.markdown("""
         <div style="margin-top:8px;padding:8px 14px;background:rgba(245,158,11,0.08);
                     border:1px solid rgba(245,158,11,0.25);border-radius:8px;
                     font-size:12px;color:#f59e0b;">
-          📏 <strong>Amazon FBA Rule:</strong> Max pallet height = <strong>70 inches</strong>.
+          📏 <strong>Amazon FBA Rules:</strong>
+          Max height = <strong>70 in</strong> &nbsp;·&nbsp;
+          Max weight = <strong>1,400 lbs per pallet</strong>
         </div>""", unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
