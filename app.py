@@ -694,129 +694,319 @@ tab_pred, tab_add, tab_hist = st.tabs([
 # ═══════════════════════════════════════
 #  TAB 1 — PREDICT
 # ═══════════════════════════════════════
+
+# ── ERP Parsing helpers ─────────────────────────────────────
+import re as _re
+
+def parse_erp_text(text):
+    """Parse Xindus ERP copy-paste or PDF text → list of box dicts."""
+    pattern = r'(X[\w]+B\d+)\s+(?:Update\s*)?(?:\s*)?Box\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)'
+    matches = _re.findall(pattern, text)
+    boxes = []
+    for m in matches:
+        boxes.append({
+            'scan_code': m[0],
+            'width_cm':  float(m[1]),
+            'length_cm': float(m[2]),
+            'height_cm': float(m[3]),
+            'gross_kg':  float(m[5]),
+        })
+    return boxes
+
+def parse_erp_pdf(uploaded_file):
+    """Parse Xindus ERP PDF → list of box dicts."""
+    try:
+        import pdfplumber, io
+        full_text = ''
+        with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t: full_text += t + '\n'
+        return parse_erp_text(full_text)
+    except Exception as e:
+        return []
+
+def boxes_to_inputs(boxes):
+    """Convert per-box data to min/max ranges the model expects."""
+    if not boxes:
+        return None
+    ws  = [b['width_cm']  for b in boxes]
+    ls  = [b['length_cm'] for b in boxes]
+    hs  = [b['height_cm'] for b in boxes]
+    gws = [b['gross_kg']  for b in boxes]
+    return {
+        'num_boxes': len(boxes),
+        'w_mn': min(ws),   'w_mx': max(ws),
+        'l_mn': min(ls),   'l_mx': max(ls),
+        'h_mn': min(hs),   'h_mx': max(hs),
+        'k_mn': min(gws),  'k_mx': max(gws),
+        'boxes': boxes,  # keep raw for display
+    }
+
 with tab_pred:
-    left, right = st.columns([1, 1.2], gap="large")
 
-    with left:
-        st.markdown('<div class="sec-head">📦 Box Details</div>', unsafe_allow_html=True)
-        num_boxes = st.number_input("Number of Boxes", min_value=1, max_value=5000, value=80, step=1)
+    # ── INPUT MODE SELECTOR ───────────────────────────────────
+    st.markdown('<div class="sec-head">📥 How do you want to enter box details?</div>', unsafe_allow_html=True)
+    input_mode = st.radio(
+        "Input mode",
+        ["✏️  Enter Manually", "📋  Paste from ERP", "📄  Upload ERP PDF"],
+        horizontal=True, label_visibility="collapsed"
+    )
 
-        a, b = st.columns(2)
-        w_mn = a.number_input("Box Width MIN (cm)",  min_value=1.0, value=23.0, step=0.5)
-        w_mx = b.number_input("Box Width MAX (cm)",  min_value=1.0, value=25.0, step=0.5)
-        l_mn = a.number_input("Box Length MIN (cm)", min_value=1.0, value=25.0, step=0.5)
-        l_mx = b.number_input("Box Length MAX (cm)", min_value=1.0, value=27.0, step=0.5)
-        h_mn = a.number_input("Box Height MIN (cm)", min_value=1.0, value=18.0, step=0.5)
-        h_mx = b.number_input("Box Height MAX (cm)", min_value=1.0, value=20.0, step=0.5)
-        k_mn = a.number_input("Box Weight MIN (kg)", min_value=0.1, value=17.0, step=0.5)
-        k_mx = b.number_input("Box Weight MAX (kg)", min_value=0.1, value=19.0, step=0.5)
+    # ── SHARED: will hold parsed inputs ──────────────────────
+    parsed_inputs = None
+    erp_boxes     = []
 
-        st.markdown('<div class="sec-head">🗺️ Route</div>', unsafe_allow_html=True)
-        miles = st.number_input("Distance Between Pickup & Delivery (Miles)",
-                                min_value=1, max_value=5000, value=1917, step=10)
+    # ════════════════════════════════════
+    #  MODE A — MANUAL
+    # ════════════════════════════════════
+    if input_mode == "✏️  Enter Manually":
+        left, right = st.columns([1, 1.2], gap="large")
+        with left:
+            st.markdown('<div class="sec-head">📦 Box Details</div>', unsafe_allow_html=True)
+            num_boxes = st.number_input("Number of Boxes", min_value=1, max_value=5000, value=80, step=1)
+            a, b = st.columns(2)
+            w_mn = a.number_input("Box Width MIN (cm)",  min_value=1.0, value=23.0, step=0.5)
+            w_mx = b.number_input("Box Width MAX (cm)",  min_value=1.0, value=25.0, step=0.5)
+            l_mn = a.number_input("Box Length MIN (cm)", min_value=1.0, value=25.0, step=0.5)
+            l_mx = b.number_input("Box Length MAX (cm)", min_value=1.0, value=27.0, step=0.5)
+            h_mn = a.number_input("Box Height MIN (cm)", min_value=1.0, value=18.0, step=0.5)
+            h_mx = b.number_input("Box Height MAX (cm)", min_value=1.0, value=20.0, step=0.5)
+            k_mn = a.number_input("Box Weight MIN (kg)", min_value=0.1, value=17.0, step=0.5)
+            k_mx = b.number_input("Box Weight MAX (kg)", min_value=0.1, value=19.0, step=0.5)
+            st.markdown('<div class="sec-head">🗺️ Route</div>', unsafe_allow_html=True)
+            miles = st.number_input("Distance (Miles)", min_value=1, max_value=5000, value=1917, step=10)
+            predict_btn = st.button("⚡  PREDICT THIS SHIPMENT", key="pred_manual")
 
-        predict_btn = st.button("⚡  PREDICT THIS SHIPMENT")
+        with right:
+            if predict_btn:
+                parsed_inputs = {
+                    'num_boxes': num_boxes,
+                    'w_mn': w_mn, 'w_mx': w_mx,
+                    'l_mn': l_mn, 'l_mx': l_mx,
+                    'h_mn': h_mn, 'h_mx': h_mx,
+                    'k_mn': k_mn, 'k_mx': k_mx,
+                }
+                st.session_state['pred_miles']  = miles
+                st.session_state['pred_inputs'] = parsed_inputs
 
-    with right:
-        if predict_btn:
-            wn=w_mn*CM_IN; wx=w_mx*CM_IN
-            ln=l_mn*CM_IN; lx=l_mx*CM_IN
-            hn=h_mn*CM_IN; hx=h_mx*CM_IN
-            tn=k_mn*KG_LBS; tx=k_mx*KG_LBS
+    # ════════════════════════════════════
+    #  MODE B — PASTE FROM ERP
+    # ════════════════════════════════════
+    elif input_mode == "📋  Paste from ERP":
+        st.markdown("""
+        <div class="info-box">
+          Go to your Xindus ERP shipment page → select all text (Ctrl+A) → copy (Ctrl+C) → paste below.
+          The app will automatically extract all box dimensions and weights.
+        </div>""", unsafe_allow_html=True)
 
-            with st.spinner("🧠 Running 6 AI models..."):
-                R = run_prediction(M, num_boxes, wn,wx, ln,lx, hn,hx, tn,tx, miles)
+        erp_text = st.text_area(
+            "Paste ERP page content here",
+            height=180,
+            placeholder="Paste the full ERP page text here (Ctrl+A, Ctrl+C from the ERP page)...",
+            key="erp_paste"
+        )
 
-            # Save to session so Tab 2 can pre-fill
-            st.session_state['last_inputs'] = {
-                'num_boxes':num_boxes,'w_mn':w_mn,'w_mx':w_mx,
-                'l_mn':l_mn,'l_mx':l_mx,'h_mn':h_mn,'h_mx':h_mx,
-                'k_mn':k_mn,'k_mx':k_mx,'miles':miles,
-            }
-            st.session_state['last_result'] = R
+        col_parse, col_miles_b = st.columns([2,1])
+        with col_miles_b:
+            miles_b = st.number_input("Distance (Miles)", min_value=1, max_value=5000, value=1917, step=10, key="miles_b")
 
-            # ── A. PALLETS
-            st.markdown('<div class="res-card"><div class="res-card-title">A · Palletization</div>', unsafe_allow_html=True)
+        parse_btn = st.button("🔍  EXTRACT BOXES & PREDICT", key="pred_paste")
 
-            # Height violation warning banner
-            if R['height_violated']:
-                st.error(
-                    f"⚠️ **Amazon Height Limit Enforced** — ML predicted {R['original_height']}in, "
-                    f"which exceeds the **70-inch Amazon FBA limit**. "
-                    f"Pallets have been automatically split to keep height ≤ 70in. "
-                    f"**Do not consolidate these pallets or Amazon will reject the shipment.**"
-                )
+        if erp_text and parse_btn:
+            erp_boxes = parse_erp_text(erp_text)
+            if erp_boxes:
+                parsed_inputs = boxes_to_inputs(erp_boxes)
+                st.session_state['pred_miles']  = miles_b
+                st.session_state['pred_inputs'] = parsed_inputs
+                st.session_state['erp_boxes']   = erp_boxes
+            else:
+                st.error("❌ Could not find any box data in the pasted text. Make sure you copied the full ERP page.")
 
-            ma, mb = st.columns(2)
-            ma.metric("Total Pallets", R['n_pal'])
-            mb.metric("Total Weight",  f"{R['total_wt']:,.0f} lbs")
+        # Show parsed box table if available
+        if erp_text and not parse_btn:
+            preview = parse_erp_text(erp_text)
+            if preview:
+                st.success(f"✅ Found **{len(preview)} boxes** — click EXTRACT & PREDICT to run the model")
 
-            for p in R['pallets']:
-                height_ok = p['h'] <= MAX_PALLET_HEIGHT
-                border_color = "#00c896" if height_ok else "#f43f5e"
-                height_label = f"{p['h']}in ✅" if height_ok else f"{p['h']}in ⚠️ OVER LIMIT"
-                st.markdown(f"""
-                <div class="pallet-row" style="border-color:rgba({('0,200,150' if height_ok else '244,63,94')},0.35);">
-                  <span class="p-label">PALLET {p['no']}</span>
-                  <span class="p-dim">L=40in &nbsp; W=48in &nbsp; H={height_label}</span>
-                  <span class="p-wt">{p['wt']:,.0f} lbs &nbsp;·&nbsp; {p['boxes']} boxes</span>
-                </div>""", unsafe_allow_html=True)
+    # ════════════════════════════════════
+    #  MODE C — UPLOAD PDF
+    # ════════════════════════════════════
+    elif input_mode == "📄  Upload ERP PDF":
+        st.markdown("""
+        <div class="info-box">
+          In your Xindus ERP, open the shipment → press <strong>Ctrl+P</strong> → Save as PDF.
+          Then upload that PDF here. All box dimensions and weights will be extracted automatically.
+        </div>""", unsafe_allow_html=True)
 
-            # Always show the 70in rule as a reminder
-            st.markdown("""
-            <div style="margin-top:8px;padding:8px 14px;background:rgba(245,158,11,0.08);
-                        border:1px solid rgba(245,158,11,0.25);border-radius:8px;
-                        font-size:12px;color:#f59e0b;">
-              📏 <strong>Amazon FBA Rule:</strong> Max pallet height = <strong>70 inches</strong>.
-              All pallets above are within this limit.
-            </div>""", unsafe_allow_html=True)
+        col_pdf, col_miles_c = st.columns([2,1])
+        with col_pdf:
+            uploaded_pdf = st.file_uploader("Upload Xindus ERP PDF", type=["pdf"], key="erp_pdf")
+        with col_miles_c:
+            miles_c = st.number_input("Distance (Miles)", min_value=1, max_value=5000, value=1917, step=10, key="miles_c")
 
-            st.markdown('</div>', unsafe_allow_html=True)
+        if uploaded_pdf:
+            with st.spinner("📄 Reading PDF and extracting box data..."):
+                erp_boxes = parse_erp_pdf(uploaded_pdf)
 
-            # ── B. COST
+            if erp_boxes:
+                parsed_inputs = boxes_to_inputs(erp_boxes)
+                st.session_state['pred_miles']  = miles_c
+                st.session_state['pred_inputs'] = parsed_inputs
+                st.session_state['erp_boxes']   = erp_boxes
+            else:
+                st.error("❌ Could not extract box data from this PDF. Make sure it's the Xindus ERP shipment page saved as PDF.")
+
+    # ════════════════════════════════════
+    #  SHARED: Show parsed box summary + predict
+    # ════════════════════════════════════
+    if parsed_inputs and input_mode != "✏️  Enter Manually":
+        erp_boxes = st.session_state.get('erp_boxes', [])
+        miles     = st.session_state.get('pred_miles', 1917)
+
+        # Show parsed data summary
+        st.markdown(f"""
+        <div style="background:rgba(0,200,150,0.07);border:1px solid rgba(0,200,150,0.25);
+                    border-radius:10px;padding:14px 18px;margin:12px 0;">
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#00c896;
+                      font-weight:600;margin-bottom:10px;">✅ EXTRACTED FROM ERP — {parsed_inputs['num_boxes']} BOXES</div>
+          <div style="display:flex;gap:32px;font-size:13px;color:#94a3b8;flex-wrap:wrap;">
+            <span>Width: <strong style="color:#e2e8f0">{parsed_inputs['w_mn']}–{parsed_inputs['w_mx']} cm</strong></span>
+            <span>Length: <strong style="color:#e2e8f0">{parsed_inputs['l_mn']}–{parsed_inputs['l_mx']} cm</strong></span>
+            <span>Height: <strong style="color:#e2e8f0">{parsed_inputs['h_mn']}–{parsed_inputs['h_mx']} cm</strong></span>
+            <span>Weight: <strong style="color:#e2e8f0">{parsed_inputs['k_mn']}–{parsed_inputs['k_mx']} kg/box</strong></span>
+            <span>Total weight: <strong style="color:#00c896">{sum(b['gross_kg'] for b in erp_boxes):.1f} kg</strong></span>
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        # Expandable box-by-box table
+        with st.expander(f"📋 View all {len(erp_boxes)} boxes", expanded=False):
+            box_df = pd.DataFrame(erp_boxes)
+            box_df.columns = ['Scan Code','Width (cm)','Length (cm)','Height (cm)','Gross Weight (kg)']
+            st.dataframe(box_df, use_container_width=True, hide_index=True)
+
+        predict_btn_erp = st.button("⚡  PREDICT THIS SHIPMENT", key="pred_erp")
+        if predict_btn_erp:
+            st.session_state['do_predict'] = True
+            st.session_state['pred_inputs'] = parsed_inputs
+
+    # ════════════════════════════════════
+    #  RESULTS (shared for all modes)
+    # ════════════════════════════════════
+    do_predict = st.session_state.get('do_predict', False) if input_mode != "✏️  Enter Manually" else ('pred_manual' in st.session_state and st.session_state.get('pred_inputs'))
+
+    # Resolve final inputs & miles
+    final_inputs = st.session_state.get('pred_inputs') if input_mode != "✏️  Enter Manually" else (parsed_inputs if 'predict_btn' in dir() and predict_btn else None)
+    final_miles  = st.session_state.get('pred_miles', 1917)
+
+    # Run prediction when triggered
+    run_now = False
+    if input_mode == "✏️  Enter Manually" and 'predict_btn' in dir() and predict_btn and parsed_inputs:
+        run_now = True
+        final_inputs = parsed_inputs
+        final_miles  = miles
+    elif input_mode != "✏️  Enter Manually" and st.session_state.get('do_predict'):
+        run_now = True
+        st.session_state['do_predict'] = False
+
+    if run_now and final_inputs:
+        inp = final_inputs
+        wn = inp['w_mn']*CM_IN; wx = inp['w_mx']*CM_IN
+        ln = inp['l_mn']*CM_IN; lx = inp['l_mx']*CM_IN
+        hn = inp['h_mn']*CM_IN; hx = inp['h_mx']*CM_IN
+        tn = inp['k_mn']*KG_LBS; tx = inp['k_mx']*KG_LBS
+
+        with st.spinner("🧠 Running 6 AI models..."):
+            R = run_prediction(M, inp['num_boxes'], wn,wx, ln,lx, hn,hx, tn,tx, final_miles)
+
+        st.session_state['last_inputs'] = {
+            'num_boxes':inp['num_boxes'],
+            'w_mn':inp['w_mn'],'w_mx':inp['w_mx'],
+            'l_mn':inp['l_mn'],'l_mx':inp['l_mx'],
+            'h_mn':inp['h_mn'],'h_mx':inp['h_mx'],
+            'k_mn':inp['k_mn'],'k_mx':inp['k_mx'],
+            'miles':final_miles,
+        }
+        st.session_state['last_result'] = R
+
+        # ── A. PALLETS ─────────────────────────────────────────
+        st.markdown('<div class="res-card"><div class="res-card-title">A · Palletization</div>', unsafe_allow_html=True)
+
+        if R['height_violated']:
+            st.error(
+                f"⚠️ **Amazon Height Limit Enforced** — ML predicted {R['original_height']}in, "
+                f"which exceeds the **70-inch Amazon FBA limit**. "
+                f"Pallets have been automatically split to keep height ≤ 70in. "
+                f"**Do not consolidate these pallets or Amazon will reject the shipment.**"
+            )
+
+        ma, mb = st.columns(2)
+        ma.metric("Total Pallets", R['n_pal'])
+        mb.metric("Total Weight",  f"{R['total_wt']:,.0f} lbs")
+
+        for p in R['pallets']:
+            height_ok    = p['h'] <= MAX_PALLET_HEIGHT
+            height_label = f"{p['h']}in ✅" if height_ok else f"{p['h']}in ⚠️ OVER LIMIT"
             st.markdown(f"""
-            <div class="res-card">
-              <div class="res-card-title">B · Estimated Cost</div>
-              <div class="big-cost">${R['cost']:,.2f}</div>
-              <div style="color:#64748b;font-size:12px;margin-top:4px;">
-                Total shipment cost (USD) &nbsp;·&nbsp; {R['total_wt']:,.0f} lbs
-              </div>
+            <div class="pallet-row" style="border-color:rgba({('0,200,150' if height_ok else '244,63,94')},0.35);">
+              <span class="p-label">PALLET {p['no']}</span>
+              <span class="p-dim">L=40in &nbsp; W=48in &nbsp; H={height_label}</span>
+              <span class="p-wt">{p['wt']:,.0f} lbs &nbsp;·&nbsp; {p['boxes']} boxes</span>
             </div>""", unsafe_allow_html=True)
 
-            # ── C. CARRIER & TRANSIT
-            st.markdown(f"""
-            <div class="res-card">
-              <div class="res-card-title">C · Carrier & Transit</div>
-              <div style="display:flex;gap:40px;align-items:flex-end;">
-                <div>
-                  <div style="font-size:11px;color:#64748b;font-family:'IBM Plex Mono',monospace;
-                               text-transform:uppercase;letter-spacing:1px;">Best Carrier</div>
-                  <div class="big-carrier">{R['carrier']}</div>
-                </div>
-                <div>
-                  <div style="font-size:11px;color:#64748b;font-family:'IBM Plex Mono',monospace;
-                               text-transform:uppercase;letter-spacing:1px;">Est. Transit</div>
-                  <div class="big-transit">{R['transit']} days</div>
-                </div>
-              </div>
-            </div>""", unsafe_allow_html=True)
+        st.markdown("""
+        <div style="margin-top:8px;padding:8px 14px;background:rgba(245,158,11,0.08);
+                    border:1px solid rgba(245,158,11,0.25);border-radius:8px;
+                    font-size:12px;color:#f59e0b;">
+          📏 <strong>Amazon FBA Rule:</strong> Max pallet height = <strong>70 inches</strong>.
+        </div>""", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-            st.markdown("""
-            <div class="info-box">
-              💡 <strong>After the shipment is done</strong> — go to the
-              <strong>"ADD ACTUAL RESULT"</strong> tab and enter what really happened.
-              This teaches the AI and makes predictions better for you AND your whole team.
-            </div>""", unsafe_allow_html=True)
+        # ── B. COST ────────────────────────────────────────────
+        st.markdown(f"""
+        <div class="res-card">
+          <div class="res-card-title">B · Estimated Cost</div>
+          <div class="big-cost">${R['cost']:,.2f}</div>
+          <div style="color:#64748b;font-size:12px;margin-top:4px;">
+            Total shipment cost (USD) &nbsp;·&nbsp; {R['total_wt']:,.0f} lbs
+          </div>
+        </div>""", unsafe_allow_html=True)
 
-        else:
-            st.markdown("""
-            <div style="display:flex;flex-direction:column;align-items:center;
-                        justify-content:center;height:420px;text-align:center;">
-              <div style="font-size:64px;margin-bottom:16px;opacity:0.4;">🚚</div>
-              <div style="font-family:'IBM Plex Mono',monospace;font-size:14px;color:#64748b;">
-                Enter box details on the left<br>and click PREDICT
-              </div>
-            </div>""", unsafe_allow_html=True)
+        # ── C. CARRIER & TRANSIT ───────────────────────────────
+        st.markdown(f"""
+        <div class="res-card">
+          <div class="res-card-title">C · Carrier & Transit</div>
+          <div style="display:flex;gap:40px;align-items:flex-end;">
+            <div>
+              <div style="font-size:11px;color:#64748b;font-family:'IBM Plex Mono',monospace;
+                           text-transform:uppercase;letter-spacing:1px;">Best Carrier</div>
+              <div class="big-carrier">{R['carrier']}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#64748b;font-family:'IBM Plex Mono',monospace;
+                           text-transform:uppercase;letter-spacing:1px;">Est. Transit</div>
+              <div class="big-transit">{R['transit']} days</div>
+            </div>
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="info-box">
+          💡 <strong>After the shipment is done</strong> — go to
+          <strong>"ADD ACTUAL RESULT"</strong> tab and enter what really happened.
+          This teaches the AI and improves predictions for your whole team.
+        </div>""", unsafe_allow_html=True)
+
+    elif not run_now:
+        st.markdown("""
+        <div style="display:flex;flex-direction:column;align-items:center;
+                    justify-content:center;height:380px;text-align:center;">
+          <div style="font-size:64px;margin-bottom:16px;opacity:0.3;">🚚</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#64748b;">
+            Choose an input method above<br>and click PREDICT
+          </div>
+        </div>""", unsafe_allow_html=True)
+
 
 # ═══════════════════════════════════════
 #  TAB 2 — ADD ACTUAL RESULT
