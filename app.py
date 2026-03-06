@@ -702,25 +702,30 @@ import re as _re
 def parse_erp_text(text):
     """
     Parse Xindus ERP copy-paste or PDF text → list of box dicts.
-    Handles all real-world formats: values on same line or each on own line,
-    Windows CRLF, tabs, checkmark symbols, and 'Update' text between fields.
+
+    Handles ALL ERP type field values:
+    - "Box"    → when DWS is MANUALLY_DONE
+    - "Select" → when DWS is NOT_DONE (shipment not yet weighed)
+    - Any other single word the ERP dropdown might show
+
+    Also handles: same-line values, each value on own line, Windows CRLF,
+    tabs, checkmark symbols, and 'Update' text between fields.
     """
-    # Pattern explanation:
-    # - Scan code: X + alphanumerics + B + digits (e.g. X000706135B1)
-    # - [\s\S]{0,50}? = up to 50 chars of anything (newlines, tabs, checkmarks, 'Update')
-    # - Box keyword (word boundary, case-insensitive)
-    # - 5 numbers each separated by any whitespace/newlines: W, L, H, vol_wt, gross_wt
-    pattern = r'(X[A-Z0-9]+B\d+)[\s\S]{0,50}?(?<!\w)Box(?!\w)[\s\r\n]+([\d.]+)[\s\r\n]+([\d.]+)[\s\r\n]+([\d.]+)[\s\r\n]+([\d.]+)[\s\r\n]+([\d.]+)'
+    # (?:Box|Select|\w+) matches whatever the Type dropdown shows
+    pattern = r'(X[A-Z0-9]+B\d+)[\s\S]{0,50}?(?<!\w)(?:Box|Select|\w+)(?!\w)[\s\r\n]+([\d.]+)[\s\r\n]+([\d.]+)[\s\r\n]+([\d.]+)[\s\r\n]+([\d.]+)[\s\r\n]+([\d.]+)'
     matches = _re.findall(pattern, text, _re.IGNORECASE)
     boxes = []
     for m in matches:
-        boxes.append({
-            'scan_code': m[0],
-            'width_cm':  float(m[1]),
-            'length_cm': float(m[2]),
-            'height_cm': float(m[3]),
-            'gross_kg':  float(m[5]),  # m[4]=vol weight, m[5]=gross weight
-        })
+        try:
+            boxes.append({
+                'scan_code': m[0],
+                'width_cm':  float(m[1]),
+                'length_cm': float(m[2]),
+                'height_cm': float(m[3]),
+                'gross_kg':  float(m[5]),  # m[4]=volumetric weight, m[5]=gross weight
+            })
+        except ValueError:
+            continue
     return boxes
 
 def parse_erp_pdf(uploaded_file):
